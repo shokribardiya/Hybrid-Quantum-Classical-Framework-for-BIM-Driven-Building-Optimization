@@ -1,0 +1,428 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+سیستم هیبریدی کوانتومی-کلاسیک برای بهینه‌سازی مدل‌های ساختمانی (BIM)
+پل ارتباطی میان Revit، یادگیری ماشین و محاسبات کوانتومی
+نوشته‌شده کاملاً با Python استاندارد، بدون کتابخانه‌های خارجی
+نویسنده: دستیار سیستم جهانی برنامه‌نویسی
+تقدیم به رهبر عزیز
+"""
+
+import math
+import random
+import json
+from typing import List, Tuple, Callable
+
+# ────────────────────────────  ابزارهای جبر خطی  ────────────────────────────
+def vec_add(a: List[float], b: List[float]) -> List[float]:
+    return [x + y for x, y in zip(a, b)]
+
+def vec_sub(a: List[float], b: List[float]) -> List[float]:
+    return [x - y for x, y in zip(a, b)]
+
+def vec_scale(v: List[float], s: float) -> List[float]:
+    return [x * s for x in v]
+
+def dot(a: List[float], b: List[float]) -> float:
+    return sum(x * y for x, y in zip(a, b))
+
+def mat_vec_mul(mat: List[List[float]], vec: List[float]) -> List[float]:
+    return [dot(row, vec) for row in mat]
+
+def mat_mul(A: List[List[float]], B: List[List[float]]) -> List[List[float]]:
+    B_T = list(zip(*B))  # transpose for column access
+    return [[dot(row, col) for col in B_T] for row in A]
+
+def transpose(A: List[List[float]]) -> List[List[float]]:
+    return list(map(list, zip(*A)))
+
+def outer(a: List[complex], b: List[complex]) -> List[List[complex]]:
+    return [[x * y.conjugate() for y in b] for x in a]  # conjugate of second for outer product
+
+# ────────────────────────  شبیه‌ساز محاسبات کوانتومی  ────────────────────────
+class QuantumState:
+    def __init__(self, num_qubits: int):
+        self.n = num_qubits
+        self.size = 1 << num_qubits
+        self.state = [0.0 + 0.0j] * self.size
+        self.state[0] = 1.0 + 0.0j  # |0...0>
+
+    def apply_gate(self, gate: List[List[complex]], target: int):
+        """اعمال یک گیت تک‌کیوبیتی روی کیوبیت target"""
+        n = self.n
+        new_state = [0j] * self.size
+        for i in range(self.size):
+            if self.state[i] == 0j:
+                continue
+            bit = (i >> target) & 1
+            for b in (0, 1):
+                # محاسبه ایندکس جدید با تغییر بیت target
+                mask = 1 << target
+                j = (i & ~mask) | (b << target)
+                new_state[j] += self.state[i] * gate[b][bit]
+        self.state = new_state
+
+    def apply_cnot(self, control: int, target: int):
+        """گیت CNOT دو کیوبیتی"""
+        n = self.n
+        new_state = [0j] * self.size
+        for i in range(self.size):
+            if self.state[i] == 0j:
+                continue
+            ctrl_bit = (i >> control) & 1
+            targ_bit = (i >> target) & 1
+            if ctrl_bit == 1:
+                targ_bit ^= 1  # flip
+                # ساختن ایندکس جدید
+                mask = 1 << target
+                j = (i & ~mask) | (targ_bit << target)
+                new_state[j] += self.state[i]
+            else:
+                new_state[i] += self.state[i]
+        self.state = new_state
+
+    def measure(self) -> int:
+        """اندازه‌گیری در پایه محاسباتی، خروجی رشته بیت به‌صورت عدد صحیح"""
+        probs = [abs(amp)**2 for amp in self.state]
+        r = random.random()
+        cum = 0.0
+        for idx, p in enumerate(probs):
+            cum += p
+            if r < cum:
+                return idx
+        return self.size - 1
+
+# گیت‌های معروف
+I_GATE = [[1, 0], [0, 1]]
+X_GATE = [[0, 1], [1, 0]]
+H_GATE = [[1/math.sqrt(2), 1/math.sqrt(2)],
+          [1/math.sqrt(2), -1/math.sqrt(2)]]
+
+def RX(theta: float) -> List[List[complex]]:
+    c = math.cos(theta/2)
+    s = math.sin(theta/2)
+    return [[c, -1j*s], [-1j*s, c]]
+
+def RY(theta: float) -> List[List[complex]]:
+    c = math.cos(theta/2)
+    s = math.sin(theta/2)
+    return [[c, -s], [s, c]]
+
+def RZ(theta: float) -> List[List[complex]]:
+    e = math.e ** (1j * theta/2)
+    return [[e**(-1j*theta/2) if False else math.e**(-1j*theta/2), 0],
+            [0, math.e**(1j*theta/2)]]  # simplified: diag(e^{-iθ/2}, e^{iθ/2})
+    # Let's write properly:
+    # return [[cmath.exp(-1j*theta/2), 0], [0, cmath.exp(1j*theta/2)]]
+# better:
+import cmath
+def RZ_gate(theta: float) -> List[List[complex]]:
+    return [[cmath.exp(-1j*theta/2), 0], [0, cmath.exp(1j*theta/2)]]
+
+# ────────────  مدار کوانتومی پارامتری (Variational Quantum Circuit)  ────────────
+class VQC:
+    def __init__(self, n_qubits: int, n_params: int):
+        self.n_qubits = n_qubits
+        self.n_params = n_params
+        # ساختار: هر پارامتر به یک گیت RY روی یک کیوبیت خاص و سپس درهم‌تنیدگی CNOT
+        # طرح ساده: لایه‌ای از RY روی همه کیوبیت‌ها، بعد زنجیره CNOT، این چرخه تکرار می‌شود
+        self.depth = max(1, n_params // n_qubits)
+
+    def _build_circuit(self, params: List[float]) -> List[Callable]:
+        """برمی‌گرداند لیستی از توابع که روی QuantumState اعمال شوند"""
+        ops = []
+        idx = 0
+        for _ in range(self.depth):
+            for q in range(self.n_qubits):
+                if idx < len(params):
+                    theta = params[idx]
+                    ops.append(('RY', q, theta))
+                    idx += 1
+            # زنجیره CNOT
+            for q in range(self.n_qubits - 1):
+                ops.append(('CNOT', q, q+1))
+        return ops
+
+    def execute(self, params: List[float]) -> QuantumState:
+        qs = QuantumState(self.n_qubits)
+        ops = self._build_circuit(params)
+        for op in ops:
+            if op[0] == 'RY':
+                _, target, theta = op
+                qs.apply_gate(RY(theta), target)
+            elif op[0] == 'CNOT':
+                _, c, t = op
+                qs.apply_cnot(c, t)
+        return qs
+
+    def expectation_z(self, params: List[float], qubit: int = 0) -> float:
+        """مقدار انتظاری عملگر Z روی کیوبیت مشخص (برای سادگی پایه محاسباتی)"""
+        qs = self.execute(params)
+        # expectation = sum_i (-1)^{bit_i} * |amp_i|^2
+        exp = 0.0
+        for i, amp in enumerate(qs.state):
+            bit = (i >> qubit) & 1
+            prob = abs(amp)**2
+            exp += (1 if bit == 0 else -1) * prob
+        return exp
+
+# ────────────────────────  شبکه عصبی کلاسیک (MLP)  ────────────────────────
+def sigmoid(x: float) -> float:
+    return 1.0 / (1.0 + math.exp(-x))
+
+def sigmoid_deriv(x: float) -> float:
+    s = sigmoid(x)
+    return s * (1 - s)
+
+def relu(x: float) -> float:
+    return max(0.0, x)
+
+def relu_deriv(x: float) -> float:
+    return 1.0 if x > 0 else 0.0
+
+class NeuralNetwork:
+    def __init__(self, layers: List[int]):
+        self.layers = layers
+        self.weights = []
+        self.biases = []
+        for i in range(len(layers)-1):
+            w = [[random.gauss(0, 1) for _ in range(layers[i])] for _ in range(layers[i+1])]
+            b = [random.gauss(0, 1) for _ in range(layers[i+1])]
+            self.weights.append(w)
+            self.biases.append(b)
+
+    def forward(self, x: List[float]) -> List[float]:
+        self.activations = [x]
+        self.zs = []
+        a = x
+        for w, b in zip(self.weights[:-1], self.biases[:-1]):
+            z = vec_add(mat_vec_mul(w, a), b)
+            self.zs.append(z)
+            a = [relu(zi) for zi in z]
+            self.activations.append(a)
+        # لایه آخر خطی (رگرسیون)
+        w, b = self.weights[-1], self.biases[-1]
+        z = vec_add(mat_vec_mul(w, a), b)
+        self.zs.append(z)
+        a = z  # خروجی خطی
+        self.activations.append(a)
+        return a
+
+    def train(self, X: List[List[float]], Y: List[List[float]], epochs: int, lr: float):
+        n_samples = len(X)
+        for epoch in range(epochs):
+            total_loss = 0.0
+            for x, y in zip(X, Y):
+                # forward
+                pred = self.forward(x)
+                # loss = 0.5 * sum((pred_i - y_i)**2)
+                loss = 0.5 * sum((p - t)**2 for p, t in zip(pred, y))
+                total_loss += loss
+                # backward
+                # delta خروجی
+                delta = [p - t for p, t in zip(pred, y)]  # derivative of loss w.r.t output (linear)
+                # پس‌انتشار
+                for l in range(len(self.weights)-1, -1, -1):
+                    # delta برای لایه l
+                    if l < len(self.weights)-1:
+                        # delta = (W_{l+1}^T @ delta_{l+1}) * relu_deriv(z_l)
+                        w_next = self.weights[l+1]
+                        delta = [dot([w_next[j][i] for j in range(len(w_next))], delta_next) * relu_deriv(z)
+                                 for i, z in enumerate(self.zs[l])]
+                        delta_next = delta
+                    else:
+                        delta_next = delta
+                    # به‌روزرسانی وزن‌ها و بایاس
+                    a_prev = self.activations[l]
+                    for i in range(len(self.weights[l])):
+                        for j in range(len(self.weights[l][0])):
+                            self.weights[l][i][j] -= lr * delta_next[i] * a_prev[j]
+                        self.biases[l][i] -= lr * delta_next[i]
+            if epoch % 50 == 0:
+                pass  # می‌تونیم loss چاپ کنیم
+
+# ────────────────────────  مدل BIM ساده (شبیه‌ساز Revit)  ────────────────────────
+class BIMRoom:
+    def __init__(self, name: str, area: float, window_area: float, wall_uvalue: float, orientation: int):
+        self.name = name
+        self.area = area
+        self.window_area = window_area      # مترمربع
+        self.wall_uvalue = wall_uvalue      # W/m²K
+        self.orientation = orientation      # 0: شمال, 1: شرق, 2: جنوب, 3: غرب
+
+    def feature_vector(self) -> List[float]:
+        # بردار ویژگی برای یادگیری ماشین
+        return [self.area, self.window_area, self.wall_uvalue, float(self.orientation)]
+
+class BIMModel:
+    def __init__(self):
+        self.rooms = []
+
+    def add_room(self, room: BIMRoom):
+        self.rooms.append(room)
+
+    def global_features(self) -> List[float]:
+        # مجموع ویژگی‌ها (ساده‌سازی)
+        return [
+            sum(r.area for r in self.rooms),
+            sum(r.window_area for r in self.rooms),
+            sum(r.wall_uvalue for r in self.rooms) / len(self.rooms),
+            sum(r.orientation for r in self.rooms) / len(self.rooms)
+        ]
+
+# ────────────  تولید داده آموزشی و هدف (مصرف انرژی ساختگی)  ────────────
+def simulate_energy(room: BIMRoom) -> float:
+    """فرمول جعلی برای مصرف انرژی سالیانه (کیلووات‌ساعت)"""
+    # مصرف با window_area رابطه خطی مثبت (اتلاف حرارتی)، wall_uvalue مثبت، area مثبت
+    base = 100 * room.area + 200 * room.window_area * room.wall_uvalue
+    # اثر جهت‌گیری (جنوب گرمای بیشتری می‌گیرد، شمال سردتر)
+    orientation_factor = [1.2, 1.0, 0.8, 1.0][room.orientation]
+    return base * orientation_factor + random.gauss(0, 50)
+
+def generate_dataset(n_samples=200) -> Tuple[List[List[float]], List[List[float]]]:
+    X = []
+    Y = []
+    for _ in range(n_samples):
+        area = random.uniform(15, 50)
+        wwr = random.uniform(0.1, 0.6)  # window-to-wall ratio (نماینده window_area)
+        window_area = wwr * area * 0.3  # فرض 30% دیوار خارجی
+        wall_u = random.uniform(0.2, 1.5)
+        orient = random.randint(0, 3)
+        room = BIMRoom("sample", area, window_area, wall_u, orient)
+        energy = simulate_energy(room)
+        X.append(room.feature_vector())
+        Y.append([energy])
+    return X, Y
+
+# ────────────  بهینه‌ساز هیبریدی VQC + شبکه عصبی  ────────────
+class HybridOptimizer:
+    def __init__(self, nn: NeuralNetwork, vqc: VQC, bim_model: BIMModel):
+        self.nn = nn
+        self.vqc = vqc
+        self.bim = bim_model
+
+    def predict_energy(self, design_params: List[float]) -> float:
+        """
+        design_params: [window_area_factor, wall_uvalue] (متغیرهای طراحی)
+        برای سادگی، فقط دو پارامتر را بهینه می‌کنیم و بقیه را از مدل BIM واقعی می‌گیریم.
+        اما چون مدل واقعی نداریم، یک بردار ساختگی می‌سازیم.
+        """
+        # یک اتاق نمونه با مقادیر پایه
+        base_features = self.bim.global_features()  # مثلاً [area_sum, win_sum, u_avg, orient_avg]
+        # جایگزینی دو ویژگی با مقادیر بهینه‌شونده
+        new_features = [
+            base_features[0],
+            design_params[0] * base_features[0] * 0.3,  # window_area جدید
+            design_params[1],  # wall_uvalue جدید
+            base_features[3]
+        ]
+        pred = self.nn.forward(new_features)
+        return pred[0]
+
+    def cost_function(self, design_params: List[float]) -> float:
+        energy = self.predict_energy(design_params)
+        # تابع هزینه = مصرف انرژی + جریمه اگر پنجره خیلی کم باشد (روشنایی)
+        penalty = max(0, 0.15 - design_params[0]) * 500  # حداقل نسبت پنجره
+        return energy + penalty
+
+    def optimize_with_vqc(self, initial_params: List[float], steps=30, lr=0.05):
+        """بهینه‌سازی با استفاده از VQC به عنوان تولیدکننده پارامترهای جدید"""
+        # ما از خروجی VQC برای تنظیم پارامترهای طراحی استفاده می‌کنیم.
+        # رویکرد: پارامترهای VQC را با کاهش هزینه (با روش مبتنی بر گرادیان تقریبی) به‌روز می‌کنیم.
+        vqc_params = [random.uniform(0, 2*math.pi) for _ in range(self.vqc.n_params)]
+        best_cost = float('inf')
+        best_design = None
+        for step in range(steps):
+            # اجرای VQC و نگاشت به پارامترهای طراحی (0 تا 1)
+            qs = self.vqc.execute(vqc_params)
+            # اندازه‌گیری: خروجی مدار عدد صحیح 0 تا (2^n-1) -> نگاشت به بازه [0,1]
+            meas = qs.measure()
+            max_val = (1 << self.vqc.n_qubits) - 1
+            design_param_0 = meas / max_val  # window ratio
+            # پارامتر دوم را با کیوبیت دیگر یا یک شیفت می‌سازیم
+            meas2 = qs.measure()  # اندازه‌گیری دوم (تصادفی دیگر، چون حالت کلاپس نمی‌کنیم در شبیه‌ساز؟ ولی اینجا ساده گرفتیم)
+            # بهتر است از expectation استفاده کنیم تا کوانتومی‌تر باشد.
+            # بازنویسی: استفاده از expectation برای تولید دو پارامتر
+            # ولی برای سادگی، یک مدار دیگه با شیفت پارامترها اجرا کنیم.
+            # راه حل: expectation Z از دو کیوبیت مختلف.
+            exp0 = self.vqc.expectation_z(vqc_params, qubit=0)
+            exp1 = self.vqc.expectation_z(vqc_params, qubit=1) if self.vqc.n_qubits > 1 else 0.0
+            # نگاشت expectation از [-1,1] به [0.1, 0.9] برای پنجره و [0.2, 1.5] برای u-value
+            win_ratio = (exp0 + 1) / 2 * 0.5 + 0.1  # محدوده 0.1 تا 0.6
+            wall_u = (exp1 + 1) / 2 * 1.3 + 0.2   # 0.2 تا 1.5
+            design = [win_ratio, wall_u]
+            cost = self.cost_function(design)
+            if cost < best_cost:
+                best_cost = cost
+                best_design = design
+            # تخمین گرادیان با روش finite differences روی پارامترهای VQC
+            grad = []
+            eps = 0.01
+            for i in range(len(vqc_params)):
+                orig = vqc_params[i]
+                vqc_params[i] = orig + eps
+                # محاسبه هزینه با پارامتر جدید
+                exp0_p = self.vqc.expectation_z(vqc_params, qubit=0)
+                exp1_p = self.vqc.expectation_z(vqc_params, qubit=1) if self.vqc.n_qubits > 1 else 0.0
+                win_ratio_p = (exp0_p + 1) / 2 * 0.5 + 0.1
+                wall_u_p = (exp1_p + 1) / 2 * 1.3 + 0.2
+                cost_p = self.cost_function([win_ratio_p, wall_u_p])
+                vqc_params[i] = orig - eps
+                exp0_m = self.vqc.expectation_z(vqc_params, qubit=0)
+                exp1_m = self.vqc.expectation_z(vqc_params, qubit=1) if self.vqc.n_qubits > 1 else 0.0
+                win_ratio_m = (exp0_m + 1) / 2 * 0.5 + 0.1
+                wall_u_m = (exp1_m + 1) / 2 * 1.3 + 0.2
+                cost_m = self.cost_function([win_ratio_m, wall_u_m])
+                grad.append((cost_p - cost_m) / (2*eps))
+                vqc_params[i] = orig
+            # به‌روزرسانی پارامترهای VQC با گرادیان کاهشی
+            for i in range(len(vqc_params)):
+                vqc_params[i] -= lr * grad[i]
+            # چاپ پیشرفت
+            if step % 5 == 0:
+                print(f"گام {step}: هزینه = {cost:.2f}, طراحی = [پنجره:{win_ratio:.3f}, عایق:{wall_u:.3f}]")
+        return best_design, best_cost
+
+# ────────────────────────────  برنامه اصلی  ────────────────────────────
+def main():
+    print("="*60)
+    print("سیستم بهینه‌سازی ساختمان با هوش مصنوعی و الگوریتم کوانتومی")
+    print("(بدون هیچ کتابخانه خارجی)")
+    print("="*60)
+
+    # 1. ایجاد مدل BIM ساختگی (مثلاً یک ساختمان نمونه از Revit)
+    bim = BIMModel()
+    bim.add_room(BIMRoom("اتاق نشیمن", 30, 5.0, 0.5, 2))   # جنوب
+    bim.add_room(BIMRoom("خواب ۱", 20, 2.5, 0.4, 0))       # شمال
+    bim.add_room(BIMRoom("آشپزخانه", 15, 1.5, 0.6, 3))     # غرب
+    print("مدل BIM بارگذاری شد (شبیه‌سازی Revit).")
+
+    # 2. آموزش شبکه عصبی روی داده‌های شبیه‌سازی‌شده انرژی
+    print("در حال ساخت و آموزش شبکه عصبی پیش‌بین مصرف انرژی...")
+    X, Y = generate_dataset(200)
+    nn = NeuralNetwork([4, 8, 1])  # 4 ورودی (area, window_area, uvalue, orientation) -> 1 خروجی انرژی
+    nn.train(X, Y, epochs=200, lr=0.01)
+    print("شبکه عصبی آموزش دید.")
+
+    # 3. راه‌اندازی مدار کوانتومی پارامتری
+    n_qubits = 2
+    n_params = 4  # تعداد پارامترهای RY
+    vqc = VQC(n_qubits, n_params)
+    print(f"مدار کوانتومی با {n_qubits} کیوبیت و {n_params} پارامتر آماده شد.")
+
+    # 4. بهینه‌سازی هیبریدی
+    print("\nشروع بهینه‌سازی با مدار کوانتومی (VQC)...")
+    hybrid = HybridOptimizer(nn, vqc, bim)
+    initial_design = [0.3, 0.5]  # start point window ratio, u-value
+    best_design, best_cost = hybrid.optimize_with_vqc(initial_design, steps=30, lr=0.1)
+
+    print("\n" + "="*60)
+    print("نتیجه بهینه‌سازی:")
+    print(f"نسبت بهینه سطح پنجره (WWR): {best_design[0]:.3f}")
+    print(f"مقدار بهینه U-Value دیوار: {best_design[1]:.3f} W/m²K")
+    print(f"هزینه نهایی (مصرف انرژی + جریمه): {best_cost:.2f}")
+    print("="*60)
+    print("آماده برای اعمال این پارامترها در مدل Revit (از طریق API یا Dynamo).")
+
+if __name__ == "__main__":
+    main()
